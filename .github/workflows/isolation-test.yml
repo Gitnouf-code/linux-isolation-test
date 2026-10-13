@@ -1,0 +1,111 @@
+name: Linux Isolation Test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Test read-only and noatime filesystem
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          export LC_ALL=C
+
+          echo "=== RUNNER INFORMATION ==="
+          uname -a
+          sudo -n true
+
+          ROOT="$(mktemp -d)"
+          chmod 755 "$ROOT"
+          mkdir "$ROOT/sealed"
+
+          cleanup() {
+            sudo umount "$ROOT/sealed" 2>/dev/null || true
+            rm -rf "$ROOT" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          echo "=== CREATE FICTIONAL FILESYSTEM ==="
+
+          sudo mount -t tmpfs \
+            -o size=8m,noatime \
+            tmpfs "$ROOT/sealed"
+
+          sudo chmod 777 "$ROOT/sealed"
+
+          echo "FICTIONAL DATA ONLY" |
+            sudo tee "$ROOT/sealed/test.txt" >/dev/null
+
+          sudo chmod 666 "$ROOT/sealed/test.txt"
+
+          sudo touch -a -d '2001-01-01 UTC' \
+            "$ROOT/sealed/test.txt"
+
+          echo "=== ENABLE READ-ONLY PROTECTION ==="
+
+          sudo mount -o remount,ro,noatime "$ROOT/sealed"
+
+          findmnt -T "$ROOT/sealed"
+
+          OPTIONS="$(findmnt -T "$ROOT/sealed" -no OPTIONS)"
+
+          if ! grep -Eq '(^|,)ro(,|$)' <<< "$OPTIONS"; then
+            echo "FAIL: Read-only mount not confirmed"
+            exit 1
+          fi
+
+          if ! grep -Eq '(^|,)noatime(,|$)' <<< "$OPTIONS"; then
+            echo "FAIL: noatime not confirmed"
+            exit 1
+          fi
+
+          echo "PASS: ro and noatime mount options confirmed"
+
+          echo "=== VERIFY METADATA PRESERVATION ==="
+
+          export TEST_FILE="$ROOT/sealed/test.txt"
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["TEST_FILE"])
+
+          before = path.stat()
+          for _ in range(10):
+              assert path.read_text() == "FICTIONAL DATA ONLY\n"
+          after = path.stat()
+
+          assert before.st_atime_ns == after.st_atime_ns
+          assert before.st_mtime_ns == after.st_mtime_ns
+          assert before.st_ctime_ns == after.st_ctime_ns
+
+          print("PASS: File timestamps unchanged after reads")
+          PY
+
+          echo "=== VERIFY WRITE DENIAL ==="
+
+          if sudo -u nobody sh -c \
+            'echo CHANGED > "$1"' sh "$TEST_FILE" \
+            >"$ROOT/write.log" 2>&1; then
+
+            echo "FAIL: Protected file was writable"
+            exit 1
+          fi
+
+          if ! grep -qi "Read-only file system" \
+            "$ROOT/write.log"; then
+            echo "FAIL: Write denied for an unexpected reason"
+            cat "$ROOT/write.log"
+            exit 1
+          fi
+
+          echo "PASS: Write denied by read-only filesystem"
+          echo "=== INITIAL INFRASTRUCTURE PREFLIGHT PASS ==="
