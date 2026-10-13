@@ -1,0 +1,479 @@
+name: Stage 2 Fictional Linux Qualification
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - qualification/stage2-linux-boundary
+    paths:
+      - '.github/workflows/stage2-qualification.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: stage2-fictional-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  fictional-qualification:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    steps:
+      - name: Qualify fictional ext4 protection, metadata and Git controls
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          test "$(uname -m)" = "x86_64"
+          sudo -n true
+          mkdir -p "$RUNNER_TEMP/stage2-tools"
+          cat > "$RUNNER_TEMP/stage2-tools/stage2_qualification.py" <<'STAGE2_SYNTHETIC_PY'
+          #!/usr/bin/env python3
+          """Fictional-only Linux filesystem qualification. NOT application/recovery testing."""
+          import errno
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import platform
+          import shutil
+          import stat
+          import subprocess
+          import sys
+          import tempfile
+          import time
+          import traceback
+          
+          os.umask(0o077)
+          EVIDENCE = Path(sys.argv[1]).resolve()
+          RUNNER_UID = int(sys.argv[2])
+          ROOT = None
+          MOUNTED = False
+          GATES = []
+          COMMANDS = 0
+          
+          
+          def save(name, obj):
+              path = EVIDENCE / name
+              path.parent.mkdir(parents=True, exist_ok=True)
+              data = (json.dumps(obj, indent=2, sort_keys=True) + '\n').encode()
+              tmp = path.with_name(path.name + '.pending')
+              with tmp.open('xb') as file:
+                  file.write(data)
+                  file.flush()
+                  os.fsync(file.fileno())
+              os.replace(tmp, path)
+              fd = os.open(str(path.parent), os.O_RDONLY | os.O_DIRECTORY)
+              try:
+                  os.fsync(fd)
+              finally:
+                  os.close(fd)
+              if path.read_bytes() != data:
+                  raise RuntimeError('evidence readback mismatch for ' + name)
+              return path
+          
+          
+          def run(argv, *, uid=None, cwd=None, allow_failure=False, env=None, label='command'):
+              global COMMANDS
+              COMMANDS += 1
+              serial = f'{COMMANDS:03d}'
+              clean = {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'HOME': '/nonexistent',
+                       'GIT_OPTIONAL_LOCKS': '0', 'GIT_CONFIG_NOSYSTEM': '1',
+                       'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0'}
+              if env:
+                  clean.update(env)
+              actual = list(argv)
+              if uid is not None:
+                  actual = ['setpriv', '--reuid', str(uid), '--regid', str(uid),
+                            '--clear-groups', '--no-new-privs'] + actual
+              intent = {'id': serial, 'label': label, 'argv': actual, 'cwd': str(cwd) if cwd else None,
+                        'uid': uid, 'time_ns': time.time_ns()}
+              save('commands/' + serial + '-intent.json', intent)
+              try:
+                  result = subprocess.run(actual, cwd=cwd, env=clean, capture_output=True,
+                                          timeout=45, check=False)
+                  record = {'id': serial, 'returncode': result.returncode,
+                            'stdout': result.stdout.decode('utf-8', 'replace')[:20000],
+                            'stderr': result.stderr.decode('utf-8', 'replace')[:20000],
+                            'time_ns': time.time_ns()}
+              except BaseException as ex:
+                  record = {'id': serial, 'exception': repr(ex), 'time_ns': time.time_ns()}
+                  save('commands/' + serial + '-result.json', record)
+                  raise
+              save('commands/' + serial + '-result.json', record)
+              if result.returncode and not allow_failure:
+                  raise RuntimeError(f'Command {serial} {label} exited {result.returncode}: {record["stderr"][-800:]}')
+              return result
+          
+          
+          def gate(name, fn):
+              print('GATE', name, flush=True)
+              try:
+                  detail = fn() or {}
+                  GATES.append({'gate': name, 'result': 'PASS', 'detail': detail})
+                  save('gate-results.json', GATES)
+                  print('PASS', name, flush=True)
+              except Exception as ex:
+                  GATES.append({'gate': name, 'result': 'FAIL', 'error': str(ex),
+                                'traceback': traceback.format_exc()})
+                  save('gate-results.json', GATES)
+                  print('FAIL', name, str(ex), flush=True)
+                  raise
+          
+          
+          def require(condition, message):
+              if not condition:
+                  raise RuntimeError(message)
+          
+          
+          def sha(path):
+              d = hashlib.sha256()
+              with open(path, 'rb') as file:
+                  while True:
+                      part = file.read(262144)
+                      if not part:
+                          break
+                      d.update(part)
+              return d.hexdigest()
+          
+          
+          def inventory(base, *, strict_read=True):
+              """Physical snapshot; includes directories, files, symlink targets, and xattrs."""
+              records = {}
+              paths = [Path(base)]
+              for parent, dirs, files in os.walk(base, topdown=True, followlinks=False):
+                  dirs.sort()
+                  files.sort()
+                  paths.extend(Path(parent) / name for name in dirs + files)
+                  dirs[:] = [name for name in dirs if not (Path(parent) / name).is_symlink()]
+              for path in sorted(paths, key=lambda p: os.fsencode(str(p.relative_to(base)))):
+                  st = path.lstat()
+                  relative = str(path.relative_to(base)) or '.'
+                  fields = {k: getattr(st, k) for k in ('st_mode', 'st_uid', 'st_gid',
+                            'st_dev', 'st_ino', 'st_nlink', 'st_size', 'st_atime_ns',
+                            'st_mtime_ns', 'st_ctime_ns')}
+                  fields['type'] = ('file' if stat.S_ISREG(st.st_mode) else
+                                    'dir' if stat.S_ISDIR(st.st_mode) else
+                                    'symlink' if stat.S_ISLNK(st.st_mode) else 'other')
+                  fields['birthtime'] = getattr(st, 'st_birthtime_ns', 'NOT_EXPOSED')
+                  if stat.S_ISREG(st.st_mode):
+                      fields['sha256'] = sha(path)
+                      after = path.lstat()
+                      if strict_read:
+                          require(tuple(getattr(st, x) for x in ('st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_atime_ns')) ==
+                                  tuple(getattr(after, x) for x in ('st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_atime_ns')),
+                                  f'read changed metadata during inventory: {relative}')
+                      else:
+                          fields['st_atime_ns'] = after.st_atime_ns
+                  if stat.S_ISLNK(st.st_mode):
+                      fields['link_target'] = os.readlink(path)
+                  try:
+                      fields['xattrs'] = {x: os.getxattr(path, x, follow_symlinks=False).hex()
+                                          for x in sorted(os.listxattr(path, follow_symlinks=False))}
+                  except OSError as exc:
+                      raise RuntimeError(f'Cannot inventory xattrs for {relative}: {exc}') from exc
+                  records[relative] = fields
+              return records
+          
+          
+          def platform_check():
+              require(sys.platform.startswith('linux') and platform.machine() == 'x86_64',
+                      'Requires Linux x86_64')
+              require(os.geteuid() == 0, 'Setup controller requires sudo/root')
+              require(RUNNER_UID != 0, 'Runner host UID must be unprivileged')
+              return {'uname': platform.uname()._asdict(), 'python': sys.version,
+                      'controller_uid': os.geteuid(), 'runner_uid': RUNNER_UID}
+          
+          
+          def setup():
+              global ROOT, MOUNTED
+              ROOT = Path(tempfile.mkdtemp(prefix='stage2-fictional-', dir=os.environ.get('RUNNER_TEMP', '/tmp')))
+              ROOT.chmod(0o755)
+              (ROOT / 'image').mkdir(mode=0o700)
+              (ROOT / 'sealed').mkdir(mode=0o755)
+              image = ROOT / 'image' / 'disk.img'
+              run(['truncate', '-s', '96M', str(image)], label='create disposable blank image')
+              run(['mkfs.ext4', '-F', '-q', str(image)], label='format fictional ext4 image')
+              run(['mount', '-o', 'loop,noatime', str(image), str(ROOT / 'sealed')], label='construction mount')
+              MOUNTED = True
+              (ROOT / 'sealed').chmod(0o777)
+              repo = ROOT / 'sealed' / 'fictional-repo'
+              run(['git', 'init', '-q', '-b', 'main', str(repo)], uid=65534, label='init fictional Git')
+              run(['git', '-C', str(repo), 'config', 'user.name', 'Fictional Tester'], uid=65534)
+              run(['git', '-C', str(repo), 'config', 'user.email', 'fictional@example.invalid'], uid=65534)
+              sample = repo / 'study.txt'
+              run(['python3', '-c', 'from pathlib import Path; import sys; Path(sys.argv[1]).write_text("fictional alpha\\n")',
+                   str(sample)], uid=65534, label='create synthetic tracked content')
+              run(['git', '-C', str(repo), 'add', 'study.txt'], uid=65534)
+              run(['git', '-C', str(repo), 'commit', '-q', '-m', 'fictional baseline'], uid=65534)
+              run(['python3', '-c', 'from pathlib import Path; import sys; p=Path(sys.argv[1]); p.write_text("fictional staged\\n")',
+                   str(sample)], uid=65534)
+              run(['git', '-C', str(repo), 'add', 'study.txt'], uid=65534)
+              run(['python3', '-c', 'from pathlib import Path; import sys; p=Path(sys.argv[1]); p.write_text("fictional unstaged\\n")',
+                   str(sample)], uid=65534)
+              (ROOT / 'sealed' / 'empty-directory').mkdir()
+              os.symlink('study.txt', repo / 'fictional-link')
+              os.utime(sample, ns=(946684800_000000000, 946684800_000000000))
+              os.sync()
+              run(['umount', str(ROOT / 'sealed')], label='clean unmount before sealing')
+              MOUNTED = False
+              run(['mount', '-t', 'ext4', '-o', 'loop,ro,noatime,noload,nodev,nosuid,noexec',
+                   str(image), str(ROOT / 'sealed')], label='seal ext4 as read-only')
+              MOUNTED = True
+              return {'fixture': 'fictional only', 'root': str(ROOT), 'filesystem': 'ext4'}
+          
+          
+          def mount_boundary():
+              path = ROOT / 'sealed'
+              item = json.loads(run(['findmnt', '-J', '-T', str(path), '-o', 'TARGET,SOURCE,FSTYPE,OPTIONS'],
+                                    label='read effective mount options').stdout)['filesystems'][0]
+              opts = item['options'].split(',')
+              require(item['target'] == str(path), 'Protected mount target mismatch')
+              require(item['fstype'] == 'ext4', 'Expected ext4 mount, not tmpfs')
+              for value in ('ro', 'noatime', 'nodev', 'nosuid', 'noexec'):
+                  require(value in opts, 'Missing enforced mount flag ' + value)
+              requires = ['mount', '-no', 'ro,noatime']
+              # No provider-enforced read-only block device is claimed for this loop image.
+              mounts = run(['findmnt', '-rn', '-S', item['source'], '-o', 'TARGET,OPTIONS'],
+                           label='audit alternate mounts').stdout.decode().splitlines()
+              require(len(mounts) == 1 and mounts[0].split()[0] == str(path),
+                      'Unexpected alternate mount of image backing device')
+              return {'mount': item, 'same_source_mounts': mounts,
+                      'limit': 'Filesystem read-only, not provider-enforced disk read-only'}
+          
+          
+          def baseline():
+              base = ROOT / 'sealed'
+              first = inventory(base)
+              save('pre-git-physical-baseline.json', first)
+              second = inventory(base)
+              require(first == second, 'Physical baseline unstable during repeated inspection')
+              save('pre-git-physical-repeat.json', second)
+              git_base = base / 'fictional-repo' / '.git'
+              preimages = EVIDENCE / 'git-byte-preimages'
+              shutil.copytree(git_base, preimages, symlinks=True, copy_function=shutil.copyfile)
+              copyhashes = {str(p.relative_to(preimages)): sha(p)
+                            for p in sorted(preimages.rglob('*')) if p.is_file()}
+              save('git-preimage-manifest.json', copyhashes)
+              for filename, digest in copyhashes.items():
+                  require(digest == first['fictional-repo/.git/' + filename]['sha256'],
+                          'Git preimage copy identity mismatch: ' + filename)
+              return {'entries': len(first), 'git_preimages': len(copyhashes)}
+          
+          
+          VERIFIER_SCRIPT = r'''
+          import errno, json, os, subprocess, sys
+          from pathlib import Path
+          mount, backing, device, repo = sys.argv[1:5]
+          s = Path(repo) / 'study.txt'
+          status = Path('/proc/self/status').read_text()
+          cap = next((line.split()[1] for line in status.splitlines() if line.startswith('CapEff:')), '')
+          nnp = next((line.split()[1] for line in status.splitlines() if line.startswith('NoNewPrivs:')), '')
+          checks = {'uid': os.geteuid(), 'gid': os.getegid(), 'groups': os.getgroups(),
+                    'caps': cap, 'no_new_privs': nnp, 'backing_writable': os.access(backing, os.W_OK),
+                    'device_writable': os.access(device, os.W_OK),
+                    'github_token_present': 'GITHUB_TOKEN' in os.environ}
+          assert checks['uid'] == 65534 and checks['gid'] == 65534 and not checks['groups']
+          assert int(cap, 16) == 0 and nnp == '1'
+          assert checks['backing_writable'] is False and checks['device_writable'] is False
+          assert not checks['github_token_present']
+          # The isolated runner cannot use sudo's setuid path after no_new_privs.
+          sudo = subprocess.run(['sudo', '-n', 'true'], capture_output=True, timeout=5)
+          checks['sudo_denied'] = sudo.returncode != 0
+          assert checks['sudo_denied']
+          def attempt(name, op):
+              try:
+                  op()
+              except OSError as exc:
+                  checks[name] = {'errno': exc.errno, 'message': str(exc)}
+                  assert exc.errno == errno.EROFS, f'{name}: {exc!r} not EROFS'
+              else:
+                  raise AssertionError(name + ' unexpectedly modified protected filesystem')
+          attempt('truncate', lambda: s.write_text('CHANGED'))
+          attempt('append', lambda: s.open('ab').write(b'CHANGED'))
+          attempt('create', lambda: (Path(repo) / 'new-file').write_text('CHANGED'))
+          attempt('unlink', lambda: s.unlink())
+          attempt('rename', lambda: s.rename(Path(repo) / 'renamed'))
+          attempt('mkdir', lambda: (Path(repo) / 'new-dir').mkdir())
+          attempt('chmod', lambda: s.chmod(0o777))
+          attempt('utime', lambda: os.utime(s, None))
+          print(json.dumps(checks, sort_keys=True))
+          '''
+          
+          
+          def verifier_isolation():
+              mount = ROOT / 'sealed'
+              repo = mount / 'fictional-repo'
+              img = ROOT / 'image' / 'disk.img'
+              device = run(['findmnt', '-no', 'SOURCE', '-T', str(mount)],
+                           label='read mounted block source').stdout.decode().strip()
+              args = ['python3', '-B', '-c', VERIFIER_SCRIPT, str(mount), str(img), device, str(repo)]
+              result = run(args, uid=65534, label='unprivileged protection and alias denial')
+              detail = json.loads(result.stdout)
+              require(all(detail[x]['errno'] == errno.EROFS for x in
+                          ('truncate', 'append', 'create', 'unlink', 'rename', 'mkdir', 'chmod', 'utime')),
+                      'Missing enforced EROFS failure')
+              initial = json.loads((EVIDENCE / 'pre-git-physical-baseline.json').read_text())
+              after = inventory(mount)
+              save('after-denial-physical.json', after)
+              require(after == initial, 'Physical metadata drift during denied write testing')
+              return detail
+          
+          
+          def git_observation():
+              mount = ROOT / 'sealed'
+              repo = mount / 'fictional-repo'
+              baseline_data = json.loads((EVIDENCE / 'pre-git-physical-baseline.json').read_text())
+              cmds = [ ['git', '-C', str(repo), 'rev-parse', 'HEAD'],
+                       ['git', '-C', str(repo), 'show-ref'],
+                       ['git', '-C', str(repo), 'status', '--porcelain=v1'],
+                       ['git', '-C', str(repo), 'diff', '--cached', '--name-only'],
+                       ['git', '-C', str(repo), 'diff', '--name-only'] ]
+              responses = []
+              for idx, cmd in enumerate(cmds, 1):
+                  ret = run(cmd, uid=65534, label=f'frozen fictional Git witness {idx}')
+                  records = inventory(mount)
+                  save(f'after-git-command-{idx:02d}.json', records)
+                  require(records == baseline_data,
+                          f'Physical Git candidate changed after observation command {idx}')
+                  responses.append({'command': cmd[3:], 'output': ret.stdout.decode('utf-8', 'replace')[:1000]})
+              # Verify staged+unstaged were actually exercised.
+              require('study.txt' in responses[3]['output'] and 'study.txt' in responses[4]['output'],
+                      'Fictional staged and unstaged paths not both exercised')
+              return {'git_witnesses': responses, 'per_command_physical_snapshots': len(responses)}
+          
+          
+          def negatives():
+              """Independent fictional controls on writable copies; never alter sealed source."""
+              base = ROOT / 'sealed'
+              controls = ROOT / 'control'
+              controls.mkdir(mode=0o700)
+              copy = controls / 'sample'
+              shutil.copytree(base, copy, symlinks=True)
+              def state():
+                  return inventory(copy, strict_read=False)
+              expected = []
+              def check(label, mutate, reason):
+                  before = state()
+                  mutate()
+                  after = state()
+                  diff = {k for k in before.keys() | after.keys() if before.get(k) != after.get(k)}
+                  assert diff and reason in diff, f'Negative {label} failed to detect expected file {reason}'
+                  expected.append({'control': label, 'detected': True, 'paths': sorted(diff)[:10]})
+              target = copy / 'fictional-repo' / 'study.txt'
+              def same_size():
+                  old = target.read_bytes()
+                  target.write_bytes(bytes([(old[0] + 1) % 256]) + old[1:])
+              check('same_size_bytes', same_size, 'fictional-repo/study.txt')
+              check('mode', lambda: target.chmod(0o700), 'fictional-repo/study.txt')
+              check('timestamp_only', lambda: os.utime(target, ns=(946684799_000000000, 946684799_000000000)),
+                    'fictional-repo/study.txt')
+              def inode_replace():
+                  buf = target.read_bytes()
+                  other = target.with_suffix('.replacement')
+                  other.write_bytes(buf)
+                  os.replace(other, target)
+              check('same_byte_inode_replacement', inode_replace, 'fictional-repo/study.txt')
+              check('new_path', lambda: (copy / 'added-fictional-file').write_bytes(b'fictional'),
+                    'added-fictional-file')
+              check('deleted_path', lambda: (copy / 'added-fictional-file').unlink(),
+                    'added-fictional-file')
+              index = copy / 'fictional-repo' / '.git' / 'index'
+              def index_change():
+                  content = index.read_bytes()
+                  index.write_bytes(content[:-1] + bytes([content[-1] ^ 1]))
+              check('git_index_byte_mutation', index_change, 'fictional-repo/.git/index')
+              save('negative-controls.json', expected)
+              return {'controls': len(expected), 'results': expected}
+          
+          
+          def evidence_finalize():
+              paths = [p for p in EVIDENCE.rglob('*') if p.is_file() and p.name != 'SHA256SUMS']
+              sums = ''.join(f'{sha(p)}  {p.relative_to(EVIDENCE)}\n' for p in sorted(paths))
+              dest = EVIDENCE / 'SHA256SUMS'
+              dest.write_text(sums)
+              with dest.open('rb') as handle:
+                  os.fsync(handle.fileno())
+              require(dest.read_text() == sums, 'Checksum readback failure')
+              return {'file_count': len(paths), 'checksums_sha256': sha(dest)}
+          
+          
+          def cleanup():
+              global MOUNTED
+              if ROOT:
+                  if MOUNTED:
+                      result = subprocess.run(['umount', str(ROOT / 'sealed')], capture_output=True)
+                      if result.returncode:
+                          save('cleanup-error.json', {'error': result.stderr.decode('utf-8', 'replace')})
+                          return False
+                      MOUNTED = False
+                  shutil.rmtree(ROOT)
+              return True
+          
+          
+          def main():
+              EVIDENCE.mkdir(parents=True, exist_ok=True)
+              save('intent.json', {'purpose': 'Stage 2 fictional qualification only; no application data',
+                                   'public_repo_only': True, 'no_provider_enforced_ro_claim': True,
+                                   'time_ns': time.time_ns()})
+              success = False
+              try:
+                  gate('platform', platform_check)
+                  gate('fictional_ext4_creation_and_seal', setup)
+                  gate('effective_mount_and_alias_audit', mount_boundary)
+                  gate('durable_physical_pre_git_baseline', baseline)
+                  gate('unprivileged_write_denial_and_no_privilege_escalation', verifier_isolation)
+                  gate('frozen_git_physical_identity', git_observation)
+                  gate('independent_writable_negative_controls', negatives)
+                  success = True
+              except Exception:
+                  success = False
+              finally:
+                  clean = False
+                  try:
+                      clean = cleanup()
+                  except Exception as exc:
+                      save('cleanup-error.json', {'error': repr(exc)})
+                  if not clean:
+                      success = False
+                      GATES.append({'gate': 'cleanup', 'result': 'FAIL'})
+                  else:
+                      GATES.append({'gate': 'cleanup', 'result': 'PASS'})
+                  save('gate-results.json', GATES)
+                  save('FINAL_REPORT.json', {
+                      'verdict': 'STAGE 2 FICTIONAL QUALIFICATION PASS - NOT RECOVERY AUTHORIZATION'
+                                 if success else 'BLOCKED - STAGE 2 FICTIONAL QUALIFICATION',
+                      'gates': GATES,
+                      'not_verified': ['provider-enforced read-only disk', 'independent second VM',
+                                       'complete ACL/statx birthtime coverage',
+                                       'exact Python 3.14.7 dependency stack',
+                                       'original C2 source/reconstruction and UX2-C3 tests',
+                                       'no writable-alias proof against privileged host administrator'],
+                      'scope': 'Public fictional fixture only', 'time_ns': time.time_ns()})
+                  evidence_finalize()
+                  try:
+                      for entry in [EVIDENCE] + list(EVIDENCE.rglob('*')):
+                          os.chown(entry, RUNNER_UID, -1, follow_symlinks=False)
+                  except Exception as exc:
+                      print('Evidence ownership handoff failed:', exc, flush=True)
+                      success = False
+                  print('STAGE 2:', 'PASS (limited qualification)' if success else 'BLOCKED', flush=True)
+              return 0 if success else 1
+          
+          
+          if __name__ == '__main__':
+              sys.exit(main())
+          STAGE2_SYNTHETIC_PY
+          sudo --preserve-env=RUNNER_TEMP python3 -B "$RUNNER_TEMP/stage2-tools/stage2_qualification.py" \
+            "$RUNNER_TEMP/stage2-qualification-evidence" "$(id -u)"
+
+      - name: Upload fictional evidence even when qualification fails
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: stage2-fictional-evidence-${{ github.run_id }}
+          path: ${{ runner.temp }}/stage2-qualification-evidence/
+          if-no-files-found: warn
+          retention-days: 7
+          compression-level: 6
