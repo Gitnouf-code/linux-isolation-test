@@ -188,7 +188,7 @@ jobs:
           
           def setup():
               global ROOT, MOUNTED
-              ROOT = Path(tempfile.mkdtemp(prefix='stage2-fictional-', dir=os.environ.get('RUNNER_TEMP', '/tmp')))
+              ROOT = Path(tempfile.mkdtemp(prefix='stage2-fictional-', dir='/tmp'))
               ROOT.chmod(0o755)
               (ROOT / 'image').mkdir(mode=0o700)
               (ROOT / 'sealed').mkdir(mode=0o755)
