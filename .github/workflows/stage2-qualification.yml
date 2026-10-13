@@ -78,7 +78,7 @@ jobs:
               global COMMANDS
               COMMANDS += 1
               serial = f'{COMMANDS:03d}'
-              clean = {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'HOME': '/nonexistent',
+              clean = {'PATH': '/usr/sbin:/sbin:/usr/bin:/bin', 'LC_ALL': 'C', 'HOME': '/nonexistent',
                        'GIT_OPTIONAL_LOCKS': '0', 'GIT_CONFIG_NOSYSTEM': '1',
                        'GIT_CONFIG_GLOBAL': '/dev/null', 'GIT_TERMINAL_PROMPT': '0'}
               if env:
